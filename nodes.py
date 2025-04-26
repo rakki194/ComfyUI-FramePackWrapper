@@ -295,16 +295,47 @@ class FramePackSampler:
                 "start_embed_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Weighted average constant for image embed interpolation. If end image is not set, the embed's strength won't be affected"}),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "section_start_idx": ("INT", {"default": 0, "min": 0, "tooltip": "Start index of section"}),
+                "num_sections": ("INT", {"default": -1, "min": -1, "tooltip": "Number of sections to process (-1 for all)"}),
+                "history_latents": ("LATENT", ),
+                "total_generated_latent_frames": ("INT", {"default": 0, "min": 0, "tooltip": "Total generated latent frames"}),
             }
         }
 
-    RETURN_TYPES = ("LATENT", )
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = (
+        "LATENT",
+        "FramePackMODEL",
+        "CONDITIONING",
+        "CONDITIONING",
+        "CLIP_VISION_OUTPUT",
+        "LATENT",
+        "LATENT",
+        "CLIP_VISION_OUTPUT",
+        "LATENT",
+        "FLOAT",
+        "INT",
+        "INT"
+    )
+    RETURN_NAMES = (
+        "samples",
+        "model",
+        "positive",
+        "negative",
+        "image_embeds",
+        "start_latent",
+        "end_latent",
+        "end_embeds",
+        "history_latents",
+        "total_second_length",
+        "next_section_start_idx",
+        "total_generated_latent_frames"
+    )
     FUNCTION = "process"
     CATEGORY = "FramePackWrapper"
 
     def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0):
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0,
+                section_start_idx=0, num_sections=-1, history_latents=None, total_generated_latent_frames=0):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -318,14 +349,16 @@ class FramePackSampler:
         mm.unload_all_models()
         mm.cleanup_models()
         mm.soft_empty_cache()
-
-        start_latent = start_latent["samples"] * vae_scaling_factor
+        
+        start_latent_samples = start_latent
+        end_latent_samples = end_latent
+        start_latent = start_latent_samples["samples"] * vae_scaling_factor if start_latent_samples is not None else None
         if initial_samples is not None:
             initial_samples = initial_samples["samples"] * vae_scaling_factor
-        if end_latent is not None:
-            end_latent = end_latent["samples"] * vae_scaling_factor
-        has_end_image = end_latent is not None
-        print("start_latent", start_latent.shape)
+        if end_latent_samples is not None:
+            end_latent = end_latent_samples["samples"] * vae_scaling_factor
+        has_end_image = end_latent_samples is not None
+        print("start_latent", start_latent.shape if start_latent is not None else None)
         B, C, T, H, W = start_latent.shape
 
         start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(base_dtype).to(device)
@@ -351,14 +384,14 @@ class FramePackSampler:
             
 
         # Sampling
-
-        rnd = torch.Generator("cpu").manual_seed(seed)
         
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
-       
-        total_generated_latent_frames = 0
+        if history_latents is None:
+            history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
+        else:
+            history_latents = history_latents["samples"]
+        real_history_latents = None
 
         latent_paddings_list = list(reversed(range(total_latent_sections)))
         latent_paddings = latent_paddings_list.copy()  # Create a copy for iteration
@@ -383,10 +416,16 @@ class FramePackSampler:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
             latent_paddings_list = latent_paddings.copy()
 
-        for i, latent_padding in enumerate(latent_paddings):
-            print(f"latent_padding: {latent_padding}")
-            is_last_section = latent_padding == 0
-            is_first_section = latent_padding == latent_paddings[0]
+        if num_sections == -1:
+            num_sections = total_latent_sections - section_start_idx
+        section_end_idx = min(section_start_idx + num_sections, total_latent_sections)
+        for i in range(section_start_idx, section_end_idx):
+            # Reset rnd with the same seed for each section to keep outputs identical whether using a single sampler or multiple chained samplers.
+            rnd = torch.Generator("cpu").manual_seed(seed + i)
+
+            latent_padding = latent_paddings[i]
+            is_last_section = (i == total_latent_sections - 1)
+            is_first_section = (section_start_idx == 0 and i == 0)
             latent_padding_size = latent_padding * latent_window_size
 
             if embed_interpolation == "linear":
@@ -399,7 +438,7 @@ class FramePackSampler:
 
             image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * frac + (1 - frac) * end_image_encoder_last_hidden_state
 
-            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
+            print(f'section = {i}, latent_padding = {latent_padding}, latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
@@ -491,8 +530,25 @@ class FramePackSampler:
 
         transformer.to(offload_device)
         mm.soft_empty_cache()
+        
+        if real_history_latents is None:
+            # If no latents were generated, return the original history latents
+            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-        return {"samples": real_history_latents / vae_scaling_factor},
+        return (
+            {"samples": real_history_latents / vae_scaling_factor},
+            model,
+            positive,
+            negative,
+            image_embeds,
+            start_latent_samples,
+            end_latent_samples,
+            end_image_embeds,
+            {"samples": history_latents},
+            total_second_length,
+            section_start_idx + num_sections,
+            total_generated_latent_frames
+        )
     
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
